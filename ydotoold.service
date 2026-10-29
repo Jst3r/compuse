@@ -1,0 +1,11 @@
+[Unit]
+Description=ydotool daemon
+Documentation=man:ydotoold(8)
+
+[Service]
+ExecStart=/usr/bin/ydotoold
+ExecStartPost=/bin/sh -c 'sleep 0.5 && chmod 0666 /tmp/.ydotool_socket'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
