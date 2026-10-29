@@ -1,4 +1,4 @@
-# My own Computer Use MCP Server for Linux named compuse ;)
+# My own Computer Use MCP Server for Linux ;)
 
 Computer use with Claude works great on macOS, but on Linux and Windows it's a different story. I wanted the same experience on my KDE Plasma desktop, so I built one.
 
