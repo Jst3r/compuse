@@ -22,7 +22,7 @@ os.environ.setdefault("YDOTOOL_SOCKET", "/tmp/.ydotool_socket")
 
 mcp = FastMCP(
     "computer-use",
-    version="0.4.0",
+    version="0.5.0",
 )
 
 # ---------------------------------------------------------------------------
@@ -661,314 +661,529 @@ def _screenshot_hash(region: str | None = None) -> tuple[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# OCR helpers
+# ---------------------------------------------------------------------------
+
+def _ocr_screenshot(region: str = "") -> Image.Image:
+    """Take a full-res screenshot for OCR (no downscaling), return PIL Image."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp = f.name
+    try:
+        if SCREENSHOT_BACKEND == "spectacle":
+            _kill_spectacle()
+            subprocess.run(["spectacle", "-b", "-n", "-f", "-o", tmp],
+                           check=True, timeout=15, capture_output=True)
+        elif SCREENSHOT_BACKEND == "grim":
+            subprocess.run(["grim", tmp], check=True, timeout=10, capture_output=True)
+        elif SCREENSHOT_BACKEND == "scrot":
+            subprocess.run(["scrot", tmp], check=True, timeout=10, capture_output=True)
+        elif SCREENSHOT_BACKEND == "import":
+            subprocess.run(["import", "-window", "root", tmp],
+                           check=True, timeout=10, capture_output=True)
+        img = Image.open(tmp).copy()
+        return img
+    finally:
+        Path(tmp).unlink(missing_ok=True)
+
+
+def _ocr_find_text(text: str, region: str = "", language: str = "eng") -> list[dict]:
+    """Find text on screen via OCR, return list of {text, x, y, bounds} dicts."""
+    img = _ocr_screenshot(region)
+    offset_x, offset_y = 0, 0
+    if region:
+        parts = region.replace(",", " ").replace("x", " ").split()
+        if len(parts) == 4:
+            rx, ry, rw, rh = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+            img = img.crop((rx, ry, rx + rw, ry + rh))
+            offset_x, offset_y = rx, ry
+
+    img = img.convert("RGB")
+    scale = 3
+    img_scaled = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+    data = pytesseract.image_to_data(img_scaled, lang=language,
+                                      config="--psm 6", output_type=pytesseract.Output.DICT)
+
+    matches = []
+    search = text.lower()
+    n = len(data["text"])
+
+    for i in range(n):
+        word = data["text"][i].strip()
+        if not word:
+            continue
+        if search in word.lower():
+            x = data["left"][i] // scale + offset_x
+            y = data["top"][i] // scale + offset_y
+            w = data["width"][i] // scale
+            h = data["height"][i] // scale
+            cx, cy = x + w // 2, y + h // 2
+            matches.append({"text": word, "x": cx, "y": cy, "bounds": f"{x},{y},{w}x{h}"})
+
+    words = search.split()
+    if len(words) > 1 and not matches:
+        all_words = [(data["text"][i].strip().lower(), i) for i in range(n) if data["text"][i].strip()]
+        for idx in range(len(all_words) - len(words) + 1):
+            chunk = " ".join(all_words[idx + j][0] for j in range(len(words)))
+            if search in chunk:
+                first_i = all_words[idx][1]
+                last_i = all_words[idx + len(words) - 1][1]
+                x1 = data["left"][first_i] // scale + offset_x
+                y1 = data["top"][first_i] // scale + offset_y
+                x2 = (data["left"][last_i] + data["width"][last_i]) // scale + offset_x
+                y2 = (data["top"][last_i] + data["height"][last_i]) // scale + offset_y
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                matches.append({"text": chunk, "x": cx, "y": cy,
+                                "bounds": f"{x1},{y1},{x2 - x1}x{y2 - y1}"})
+
+    return matches
+
+
+# ---------------------------------------------------------------------------
+# MCP Tools (9 merged tools)
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def screenshot(region: str = "") -> list[dict]:
-    """Screenshot. region: 'x,y,WxH' or empty for fullscreen. Returns image."""
-    b64 = _capture_screenshot(region if region else None)
-    return [
-        {"type": "text", "text": "ok"},
-        {"type": "image", "data": b64, "mimeType": "image/jpeg"},
-    ]
+def screen(action: str = "capture", region: str = "", name: str = "",
+           resource_class: str = "", x: int = 0, y: int = 0,
+           timeout: float = 10.0, interval: float = 0.5) -> list[dict] | str:
+    """Vision. action: capture/window/diff/pixel/wait_change. region: 'x,y,WxH'."""
+    global _last_screenshot_hash, _last_screenshot_b64
 
+    if action == "capture":
+        b64 = _capture_screenshot(region if region else None)
+        return [
+            {"type": "text", "text": "ok"},
+            {"type": "image", "data": b64, "mimeType": "image/jpeg"},
+        ]
 
-@mcp.tool()
-def click(x: int, y: int, button: str = "left", click_type: str = "single") -> str:
-    """Click at (x,y). button: left/right/middle. click_type: single/double/triple."""
-    _mouse_move(x, y)
-    time.sleep(0.05)
-    _mouse_click(button, click_type)
-    return f"ok ({x},{y})"
-
-
-@mcp.tool()
-def type_text(text: str, delay_ms: int = 12) -> str:
-    """Type text at cursor. delay_ms: keystroke delay."""
-    _type_text(text, delay_ms)
-    return f"ok {len(text)} chars"
-
-
-@mcp.tool()
-def key_press(keys: str) -> str:
-    """Press keys. Examples: 'ctrl+c', 'alt+tab', 'Return', 'super'. Use '+' for combos."""
-    _key_press(keys)
-    return f"ok {keys}"
-
-
-@mcp.tool()
-def mouse_move(x: int, y: int) -> str:
-    """Move cursor to (x,y) without clicking."""
-    _mouse_move(x, y)
-    return f"ok ({x},{y})"
-
-
-@mcp.tool()
-def scroll(x: int = -1, y: int = -1, direction: str = "down", clicks: int = 3) -> str:
-    """Scroll. direction: up/down/left/right. x,y: -1 for current position."""
-    if x >= 0 and y >= 0:
-        _mouse_move(x, y)
-        time.sleep(0.05)
-    _scroll(direction, clicks)
-    pos = f"({x}, {y})" if x >= 0 else "current position"
-    return f"ok {direction} {clicks}"
-
-
-@mcp.tool()
-def drag(start_x: int, start_y: int, end_x: int, end_y: int,
-         button: str = "left", duration_ms: int = 300) -> str:
-    """Drag from (start_x,start_y) to (end_x,end_y). duration_ms: drag speed."""
-    _require_input_backend()
-
-    if INPUT_BACKEND == "xdotool":
-        _mouse_move(start_x, start_y)
-        time.sleep(0.05)
-        btn_map = {"left": "1", "right": "3", "middle": "2"}
-        btn = btn_map.get(button, "1")
-        _run(["xdotool", "mousedown", btn])
-        steps = max(5, duration_ms // 20)
-        for i in range(1, steps + 1):
-            t = i / steps
-            ix = int(start_x + (end_x - start_x) * t)
-            iy = int(start_y + (end_y - start_y) * t)
-            _run(["xdotool", "mousemove", str(ix), str(iy)])
-            time.sleep(0.02)
-        _run(["xdotool", "mouseup", btn])
-    else:
-        _mouse_move(start_x, start_y)
-        time.sleep(0.05)
-        btn_down = {"left": "0x40", "right": "0x41", "middle": "0x42"}
-        btn_up = {"left": "0x80", "right": "0x81", "middle": "0x82"}
-        _run(["ydotool", "click", btn_down.get(button, "0x40")])
-        time.sleep(0.05)
-        steps = max(5, duration_ms // 20)
-        for i in range(1, steps + 1):
-            t = i / steps
-            ix = int(start_x + (end_x - start_x) * t)
-            iy = int(start_y + (end_y - start_y) * t)
-            _run(["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)])
-            time.sleep(0.02)
-        _run(["ydotool", "click", btn_up.get(button, "0x80")])
-
-    return f"ok ({start_x},{start_y})->({end_x},{end_y})"
-
-
-@mcp.tool()
-def screen_info() -> str:
-    """Screen size, cursor, session type, backends, monitors."""
-    sw, sh = _get_screen_size()
-    try:
-        cx, cy = _get_cursor_position()
-        cursor = f"({cx}, {cy})"
-    except Exception:
-        cursor = "unknown"
-
-    mons = _get_monitors()
-
-    return json.dumps({
-        "screen_width": sw,
-        "screen_height": sh,
-        "cursor_position": cursor,
-        "session_type": SESSION_TYPE,
-        "screenshot_backend": SCREENSHOT_BACKEND,
-        "input_backend": INPUT_BACKEND,
-        "clipboard_backend": CLIPBOARD_BACKEND,
-        "kwin_available": bool(_which("qdbus6")),
-        "ocr_available": bool(_which("tesseract")),
-        "monitors": mons,
-    }, indent=2)
-
-
-@mcp.tool()
-def list_windows() -> str:
-    """List open windows with names, geometry, state."""
-    if SESSION_TYPE == "wayland" and _which("qdbus6"):
-        try:
-            windows = _kwin_list_windows()
-            if windows:
-                return json.dumps(windows, indent=2)
-        except Exception as e:
-            pass
-
-    if _which("xdotool"):
-        try:
-            out = _run(["xdotool", "search", "--onlyvisible", "--name", ""])
-            window_ids = out.strip().split("\n")[:30]
-            windows = []
-            for wid in window_ids:
-                if not wid.strip():
-                    continue
+    elif action == "window":
+        if name or resource_class:
+            if SESSION_TYPE == "wayland" and _which("qdbus6"):
+                _kwin_focus_window(resource_class=resource_class, caption=name)
+            elif _which("xdotool"):
+                search = name or resource_class
                 try:
-                    name = _run(["xdotool", "getwindowname", wid])
-                    geo = _run(["xdotool", "getwindowgeometry", wid])
-                    windows.append({"id": wid, "name": name, "geometry": geo})
+                    wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
+                    _run(["xdotool", "windowactivate", wid])
                 except Exception:
                     pass
-            return json.dumps(windows, indent=2)
-        except Exception as e:
-            return f"Error listing windows: {e}"
+            time.sleep(0.3)
+        b64 = _capture_screenshot()
+        return [
+            {"type": "text", "text": "ok"},
+            {"type": "image", "data": b64, "mimeType": "image/jpeg"},
+        ]
 
-    return "No window listing tool available"
+    elif action == "diff":
+        r = region if region else None
+        new_hash, new_b64 = _screenshot_hash(r)
+        if not _last_screenshot_hash:
+            _last_screenshot_hash = new_hash
+            _last_screenshot_b64 = new_b64
+            return [
+                {"type": "text", "text": "first capture, no previous to diff"},
+                {"type": "image", "data": new_b64, "mimeType": "image/jpeg"},
+            ]
+        changed = new_hash != _last_screenshot_hash
+        old_img = Image.open(io.BytesIO(base64.b64decode(_last_screenshot_b64))).convert("RGB")
+        new_img = Image.open(io.BytesIO(base64.b64decode(new_b64))).convert("RGB")
+        desc = "CHANGED" if changed else "NO CHANGE"
+        if old_img.size == new_img.size:
+            old_px = old_img.load()
+            new_px = new_img.load()
+            w, h = old_img.size
+            changed_pixels = 0
+            for py in range(0, h, 4):
+                for px in range(0, w, 4):
+                    if old_px[px, py] != new_px[px, py]:
+                        changed_pixels += 1
+            sampled = (h // 4) * (w // 4)
+            pct = round(changed_pixels / sampled * 100, 1) if sampled > 0 else 0
+            desc += f" ({pct}%)"
+        _last_screenshot_hash = new_hash
+        _last_screenshot_b64 = new_b64
+        return [
+            {"type": "text", "text": desc},
+            {"type": "image", "data": new_b64, "mimeType": "image/jpeg"},
+        ]
 
+    elif action == "pixel":
+        b64 = _capture_screenshot(f"{x},{y},1x1")
+        img_data = base64.b64decode(b64)
+        img = Image.open(io.BytesIO(img_data))
+        pr, pg, pb = img.getpixel((0, 0))[:3]
+        return f"#{pr:02X}{pg:02X}{pb:02X}"
 
-@mcp.tool()
-def focus_window(window_id: str = "", name: str = "", resource_class: str = "") -> str:
-    """Focus window by window_id, name substring, or resource_class."""
-    if not window_id and not name and not resource_class:
-        return "Provide window_id, name, or resource_class"
+    elif action == "wait_change":
+        timeout = min(timeout, 30.0)
+        interval = max(interval, 0.3)
+        r = region if region else None
+        initial_hash, _ = _screenshot_hash(r)
+        start = time.time()
+        while time.time() - start < timeout:
+            time.sleep(interval)
+            current_hash, _ = _screenshot_hash(r)
+            if current_hash != initial_hash:
+                return f"changed after {round(time.time() - start, 2)}s"
+        return f"no change after {timeout}s"
 
-    if SESSION_TYPE == "wayland" and _which("qdbus6") and (resource_class or name):
-        try:
-            if _kwin_focus_window(resource_class=resource_class, caption=name):
-                target = resource_class or name
-                return f"ok {target}"
-        except Exception:
-            pass
-
-    if _which("xdotool"):
-        if window_id:
-            _run(["xdotool", "windowactivate", window_id])
-            return f"ok {window_id}"
-        search = name or resource_class
-        try:
-            wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
-            _run(["xdotool", "windowactivate", wid])
-            return f"ok {search}"
-        except Exception as e:
-            return f"Window '{search}' not found: {e}"
-
-    return "No window management tool available"
-
-
-@mcp.tool()
-def window_action(action: str, name: str = "", resource_class: str = "") -> str:
-    """Window action: minimize/unminimize/maximize/unmaximize/close/fullscreen/unfullscreen."""
-    if not name and not resource_class:
-        return "Provide name or resource_class"
-
-    valid_actions = ("minimize", "unminimize", "maximize", "unmaximize",
-                     "close", "fullscreen", "unfullscreen")
-    if action not in valid_actions:
-        return f"Invalid action. Use one of: {', '.join(valid_actions)}"
-
-    if SESSION_TYPE == "wayland" and _which("qdbus6"):
-        try:
-            if _kwin_window_action(resource_class=resource_class, caption=name, action=action):
-                target = resource_class or name
-                return "ok"
-        except Exception as e:
-            return f"KWin action failed: {e}"
-
-    if _which("xdotool") and action in ("minimize", "maximize", "close"):
-        search = name or resource_class
-        try:
-            wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
-            xdo_action = {
-                "minimize": "windowminimize",
-                "maximize": "windowmaximize",  # not standard, but works on some WMs
-                "close": "windowclose",
-            }
-            _run(["xdotool", xdo_action[action], wid])
-            return "ok"
-        except Exception as e:
-            return f"xdotool action failed: {e}"
-
-    return f"Cannot perform '{action}' — no supported window manager interface"
+    return f"unknown action '{action}'"
 
 
 @mcp.tool()
-def get_active_window() -> str:
-    """Active window info (class, title, geometry, state)."""
-    if SESSION_TYPE == "wayland" and _which("qdbus6"):
-        js = """
-        var w = workspace.activeWindow;
-        if (w) {
-            console.log("__MARKER__" + JSON.stringify({
-                resourceClass: w.resourceClass,
-                caption: w.caption,
-                x: w.frameGeometry.x,
-                y: w.frameGeometry.y,
-                width: w.frameGeometry.width,
-                height: w.frameGeometry.height,
-                maximized: w.maximized,
-                fullScreen: w.fullScreen,
-                minimized: w.minimized
-            }));
-        }
-        """
-        raw = _kwin_script_with_output(js)
-        if raw:
-            try:
-                return json.dumps(json.loads(raw), indent=2)
-            except json.JSONDecodeError:
-                pass
+def ocr(action: str = "read", text: str = "", region: str = "",
+        language: str = "eng", button: str = "left", click_type: str = "single",
+        occurrence: int = 1) -> str:
+    """OCR tools. action: read/find/describe/click. No image sent — token efficient."""
+    if not _which("tesseract"):
+        return "tesseract not installed"
 
-    if _which("xdotool"):
+    if action == "read":
+        b64 = _capture_screenshot(region if region else None)
+        img = Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGB")
+        scale = 3
+        img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
         try:
-            wid = _run(["xdotool", "getactivewindow"])
-            name = _run(["xdotool", "getwindowname", wid])
-            geo = _run(["xdotool", "getwindowgeometry", wid])
-            return json.dumps({"id": wid, "name": name, "geometry": geo}, indent=2)
+            result = pytesseract.image_to_string(img, lang=language, config="--psm 6").strip()
+            return result if result else "no text"
         except Exception as e:
-            return f"Error: {e}"
+            return f"err: {e}"
 
-    return "No window info tool available"
+    elif action == "find":
+        if not text:
+            return "need text param"
+        matches = _ocr_find_text(text, region, language)
+        if not matches:
+            return f"'{text}' not found"
+        lines = [f"{len(matches)} match(es):"]
+        for m in matches[:10]:
+            lines.append(f"  '{m['text']}' click({m['x']},{m['y']})")
+        return "\n".join(lines)
+
+    elif action == "describe":
+        img = _ocr_screenshot(region)
+        screen_w, screen_h = img.size
+        offset_x, offset_y = 0, 0
+        if region:
+            parts = region.replace(",", " ").replace("x", " ").split()
+            if len(parts) == 4:
+                rx, ry, rw, rh = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                img = img.crop((rx, ry, rx + rw, ry + rh))
+                offset_x, offset_y = rx, ry
+        img = img.convert("RGB")
+        scale = 3
+        img_scaled = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
+        data = pytesseract.image_to_data(img_scaled, lang=language,
+                                          config="--psm 6", output_type=pytesseract.Output.DICT)
+        lines_by_block = {}
+        n = len(data["text"])
+        for i in range(n):
+            word = data["text"][i].strip()
+            if not word:
+                continue
+            key = (data["block_num"][i], data["line_num"][i])
+            if key not in lines_by_block:
+                lines_by_block[key] = {
+                    "words": [],
+                    "top": data["top"][i] // scale + offset_y,
+                }
+            lines_by_block[key]["words"].append(word)
+            lines_by_block[key]["bottom"] = (data["top"][i] + data["height"][i]) // scale + offset_y
+        if not lines_by_block:
+            return "no text"
+        result = [f"({screen_w}x{screen_h}):"]
+        for key in sorted(lines_by_block.keys()):
+            entry = lines_by_block[key]
+            cy = (entry["top"] + entry.get("bottom", entry["top"])) // 2
+            result.append(f"  y={cy}: {' '.join(entry['words'])}")
+        return "\n".join(result)
+
+    elif action == "click":
+        if not text:
+            return "need text param"
+        matches = _ocr_find_text(text, region, language)
+        if not matches:
+            return f"'{text}' not found"
+        idx = min(occurrence, len(matches)) - 1
+        mx, my = matches[idx]["x"], matches[idx]["y"]
+        _mouse_move(mx, my)
+        time.sleep(0.05)
+        _mouse_click(button, click_type)
+        return f"ok ({mx},{my})"
+
+    return f"unknown action '{action}'"
 
 
 @mcp.tool()
-def clipboard_get() -> str:
-    """Read the current clipboard contents."""
-    try:
-        content = _clipboard_get()
-        if len(content) > 10000:
-            return content[:10000]
-        return content
-    except Exception as e:
-        return f"Error reading clipboard: {e}"
+def inp(action: str, x: int = 0, y: int = 0, text: str = "", keys: str = "",
+        button: str = "left", click_type: str = "single", direction: str = "down",
+        clicks: int = 3, delay_ms: int = 12, start_x: int = 0, start_y: int = 0,
+        end_x: int = 0, end_y: int = 0, duration_ms: int = 300) -> str:
+    """Input. action: click/type/key/move/scroll/drag."""
+    if action == "click":
+        _mouse_move(x, y)
+        time.sleep(0.05)
+        _mouse_click(button, click_type)
+        return f"ok ({x},{y})"
 
-
-@mcp.tool()
-def clipboard_set(text: str) -> str:
-    """Set clipboard text."""
-    try:
-        _clipboard_set(text)
+    elif action == "type":
+        _type_text(text, delay_ms)
         return "ok"
-    except Exception as e:
-        return f"Error setting clipboard: {e}"
+
+    elif action == "key":
+        _key_press(keys)
+        return f"ok {keys}"
+
+    elif action == "move":
+        _mouse_move(x, y)
+        return f"ok ({x},{y})"
+
+    elif action == "scroll":
+        if x >= 0 and y >= 0 and (x > 0 or y > 0):
+            _mouse_move(x, y)
+            time.sleep(0.05)
+        _scroll(direction, clicks)
+        return "ok"
+
+    elif action == "drag":
+        _require_input_backend()
+        _mouse_move(start_x, start_y)
+        time.sleep(0.05)
+        if INPUT_BACKEND == "xdotool":
+            btn_map = {"left": "1", "right": "3", "middle": "2"}
+            btn = btn_map.get(button, "1")
+            _run(["xdotool", "mousedown", btn])
+            steps = max(5, duration_ms // 20)
+            for i in range(1, steps + 1):
+                t = i / steps
+                ix = int(start_x + (end_x - start_x) * t)
+                iy = int(start_y + (end_y - start_y) * t)
+                _run(["xdotool", "mousemove", str(ix), str(iy)])
+                time.sleep(0.02)
+            _run(["xdotool", "mouseup", btn])
+        else:
+            btn_down = {"left": "0x40", "right": "0x41", "middle": "0x42"}
+            btn_up = {"left": "0x80", "right": "0x81", "middle": "0x82"}
+            _run(["ydotool", "click", btn_down.get(button, "0x40")])
+            time.sleep(0.05)
+            steps = max(5, duration_ms // 20)
+            for i in range(1, steps + 1):
+                t = i / steps
+                ix = int(start_x + (end_x - start_x) * t)
+                iy = int(start_y + (end_y - start_y) * t)
+                _run(["ydotool", "mousemove", "--absolute", "-x", str(ix), "-y", str(iy)])
+                time.sleep(0.02)
+            _run(["ydotool", "click", btn_up.get(button, "0x80")])
+        return "ok"
+
+    return f"unknown action '{action}'"
 
 
 @mcp.tool()
-def get_pixel_color(x: int, y: int) -> str:
-    """Pixel color at (x,y). Returns hex color."""
-    b64 = _capture_screenshot(f"{x},{y},1x1")
-    img_data = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(img_data))
-    r, g, b = img.getpixel((0, 0))[:3]
-    return f"#{r:02X}{g:02X}{b:02X}"
-
-
-@mcp.tool()
-def screenshot_window(name: str = "", resource_class: str = "") -> list[dict]:
-    """Screenshot a window by name or resource_class. Focuses it first."""
-    if name or resource_class:
+def window(action: str = "list", name: str = "", resource_class: str = "",
+           window_id: str = "", x: int = 0, y: int = 0,
+           width: int = 0, height: int = 0) -> str:
+    """Window mgmt. action: list/focus/active/move/resize/minimize/maximize/close/unminimize/fullscreen/unfullscreen."""
+    if action == "list":
         if SESSION_TYPE == "wayland" and _which("qdbus6"):
-            _kwin_focus_window(resource_class=resource_class, caption=name)
-        elif _which("xdotool"):
+            try:
+                windows = _kwin_list_windows()
+                if windows:
+                    return json.dumps(windows, indent=2)
+            except Exception:
+                pass
+        if _which("xdotool"):
+            try:
+                out = _run(["xdotool", "search", "--onlyvisible", "--name", ""])
+                window_ids = out.strip().split("\n")[:30]
+                windows = []
+                for wid in window_ids:
+                    if not wid.strip():
+                        continue
+                    try:
+                        wname = _run(["xdotool", "getwindowname", wid])
+                        geo = _run(["xdotool", "getwindowgeometry", wid])
+                        windows.append({"id": wid, "name": wname, "geometry": geo})
+                    except Exception:
+                        pass
+                return json.dumps(windows, indent=2)
+            except Exception as e:
+                return f"err: {e}"
+        return "no window tool"
+
+    elif action == "focus":
+        if not window_id and not name and not resource_class:
+            return "need window_id, name, or resource_class"
+        if SESSION_TYPE == "wayland" and _which("qdbus6") and (resource_class or name):
+            try:
+                if _kwin_focus_window(resource_class=resource_class, caption=name):
+                    return "ok"
+            except Exception:
+                pass
+        if _which("xdotool"):
+            if window_id:
+                _run(["xdotool", "windowactivate", window_id])
+                return "ok"
             search = name or resource_class
             try:
                 wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
                 _run(["xdotool", "windowactivate", wid])
-            except Exception:
-                pass
-        time.sleep(0.3)
+                return "ok"
+            except Exception as e:
+                return f"not found: {e}"
+        return "no window tool"
 
-    b64 = _capture_screenshot()
-    target = resource_class or name or "active window"
-    return [
-        {"type": "text", "text": "ok"},
-        {"type": "image", "data": b64, "mimeType": "image/jpeg"},
-    ]
+    elif action == "active":
+        if SESSION_TYPE == "wayland" and _which("qdbus6"):
+            js = """
+            var w = workspace.activeWindow;
+            if (w) {
+                console.log("__MARKER__" + JSON.stringify({
+                    resourceClass: w.resourceClass,
+                    caption: w.caption,
+                    x: w.frameGeometry.x,
+                    y: w.frameGeometry.y,
+                    width: w.frameGeometry.width,
+                    height: w.frameGeometry.height,
+                    maximized: w.maximized,
+                    fullScreen: w.fullScreen,
+                    minimized: w.minimized
+                }));
+            }
+            """
+            raw = _kwin_script_with_output(js)
+            if raw:
+                try:
+                    return json.dumps(json.loads(raw), indent=2)
+                except json.JSONDecodeError:
+                    pass
+        if _which("xdotool"):
+            try:
+                wid = _run(["xdotool", "getactivewindow"])
+                wname = _run(["xdotool", "getwindowname", wid])
+                geo = _run(["xdotool", "getwindowgeometry", wid])
+                return json.dumps({"id": wid, "name": wname, "geometry": geo}, indent=2)
+            except Exception as e:
+                return f"err: {e}"
+        return "no window tool"
+
+    elif action == "move":
+        if not name and not resource_class:
+            return "need name or resource_class"
+        if SESSION_TYPE == "wayland" and _which("qdbus6"):
+            if _kwin_window_geometry(resource_class=resource_class, caption=name, x=x, y=y):
+                return "ok"
+        if _which("xdotool"):
+            search = name or resource_class
+            try:
+                wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
+                _run(["xdotool", "windowmove", wid, str(x), str(y)])
+                return "ok"
+            except Exception as e:
+                return f"err: {e}"
+        return "no window tool"
+
+    elif action == "resize":
+        if not name and not resource_class:
+            return "need name or resource_class"
+        if SESSION_TYPE == "wayland" and _which("qdbus6"):
+            if _kwin_window_geometry(resource_class=resource_class, caption=name,
+                                     width=width, height=height):
+                return "ok"
+        if _which("xdotool"):
+            search = name or resource_class
+            try:
+                wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
+                _run(["xdotool", "windowsize", wid, str(width), str(height)])
+                return "ok"
+            except Exception as e:
+                return f"err: {e}"
+        return "no window tool"
+
+    elif action in ("minimize", "unminimize", "maximize", "unmaximize",
+                    "close", "fullscreen", "unfullscreen"):
+        if not name and not resource_class:
+            return "need name or resource_class"
+        if SESSION_TYPE == "wayland" and _which("qdbus6"):
+            try:
+                if _kwin_window_action(resource_class=resource_class, caption=name, action=action):
+                    return "ok"
+            except Exception as e:
+                return f"err: {e}"
+        if _which("xdotool") and action in ("minimize", "maximize", "close"):
+            search = name or resource_class
+            try:
+                wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
+                xdo_action = {"minimize": "windowminimize", "maximize": "windowmaximize",
+                              "close": "windowclose"}
+                _run(["xdotool", xdo_action[action], wid])
+                return "ok"
+            except Exception as e:
+                return f"err: {e}"
+        return f"cannot '{action}'"
+
+    return f"unknown action '{action}'"
+
+
+@mcp.tool()
+def clipboard(action: str = "get", text: str = "") -> str:
+    """Clipboard. action: get/set."""
+    if action == "get":
+        try:
+            content = _clipboard_get()
+            return content[:10000] if len(content) > 10000 else content
+        except Exception as e:
+            return f"err: {e}"
+    elif action == "set":
+        try:
+            _clipboard_set(text)
+            return "ok"
+        except Exception as e:
+            return f"err: {e}"
+    return f"unknown action '{action}'"
+
+
+@mcp.tool()
+def notify(action: str = "read", summary: str = "", body: str = "",
+           count: int = 10, since: str = "1h") -> str:
+    """Notifications. action: send/read."""
+    if action == "send":
+        return "ok" if _send_notification(summary, body) else "failed"
+    elif action == "read":
+        notifications = _read_notifications(count, since)
+        if not notifications:
+            return "none"
+        return json.dumps(notifications, indent=2, ensure_ascii=False)
+    return f"unknown action '{action}'"
+
+
+@mcp.tool()
+def system(action: str = "info", seconds: float = 1.0) -> str:
+    """System. action: info/monitors/health/wait."""
+    if action == "info":
+        sw, sh = _get_screen_size()
+        try:
+            cx, cy = _get_cursor_position()
+            cursor = f"({cx},{cy})"
+        except Exception:
+            cursor = "?"
+        return json.dumps({
+            "screen": f"{sw}x{sh}", "cursor": cursor,
+            "session": SESSION_TYPE, "screenshot": SCREENSHOT_BACKEND,
+            "input": INPUT_BACKEND, "clipboard": CLIPBOARD_BACKEND,
+            "kwin": bool(_which("qdbus6")), "ocr": bool(_which("tesseract")),
+            "monitors": _get_monitors(),
+        }, indent=2)
+    elif action == "monitors":
+        mons = _get_monitors()
+        return json.dumps(mons, indent=2) if mons else "none"
+    elif action == "health":
+        return json.dumps(_check_backend_health(), indent=2)
+    elif action == "wait":
+        time.sleep(min(seconds, 30.0))
+        return "ok"
+    return f"unknown action '{action}'"
 
 
 @mcp.tool()
@@ -977,49 +1192,35 @@ def multi_action(actions: str) -> str:
     try:
         steps = json.loads(actions)
     except json.JSONDecodeError as e:
-        return f"Invalid JSON: {e}"
+        return f"bad json: {e}"
 
     if not isinstance(steps, list):
-        return "actions must be a JSON array"
+        return "need JSON array"
 
     results = []
     for i, step in enumerate(steps):
         if not isinstance(step, dict) or "type" not in step:
-            results.append(f"Step {i}: invalid (need 'type' key)")
+            results.append(f"{i}:invalid")
             continue
-
         t = step["type"]
         try:
             if t == "click":
                 _mouse_move(step["x"], step["y"])
                 time.sleep(0.05)
                 _mouse_click(step.get("button", "left"), step.get("click_type", "single"))
-                results.append(f"{i}:ok")
-
             elif t == "move":
                 _mouse_move(step["x"], step["y"])
-                results.append(f"{i}:ok")
-
             elif t == "type":
                 _type_text(step["text"], step.get("delay_ms", 12))
-                results.append(f"{i}:ok")
-
             elif t == "key":
                 _key_press(step["keys"])
-                results.append(f"{i}:ok")
-
             elif t == "scroll":
                 if step.get("x", -1) >= 0 and step.get("y", -1) >= 0:
                     _mouse_move(step["x"], step["y"])
                     time.sleep(0.05)
                 _scroll(step.get("direction", "down"), step.get("clicks", 3))
-                results.append(f"{i}:ok")
-
             elif t == "wait":
-                secs = min(step.get("seconds", 0.5), 10.0)
-                time.sleep(secs)
-                results.append(f"{i}:ok")
-
+                time.sleep(min(step.get("seconds", 0.5), 10.0))
             elif t == "drag":
                 _mouse_move(step["start_x"], step["start_y"])
                 time.sleep(0.05)
@@ -1038,184 +1239,26 @@ def multi_action(actions: str) -> str:
                     _mouse_move(step["end_x"], step["end_y"])
                     time.sleep(0.05)
                     _run(["ydotool", "click", btn_up])
-                results.append(f"{i}:ok")
-
             else:
                 results.append(f"{i}:unknown '{t}'")
-
+                continue
+            results.append(f"{i}:ok")
         except Exception as e:
             results.append(f"{i}:err {e}")
             break
-
     return "\n".join(results)
-
-
-@mcp.tool()
-def read_text(region: str = "", language: str = "eng") -> str:
-    """OCR screen text. region: 'x,y,WxH' or empty. language: tesseract lang code."""
-    if not _which("tesseract"):
-        return "tesseract not installed. Run: sudo pacman -S tesseract tesseract-data-eng"
-
-    b64 = _capture_screenshot(region if region else None)
-    img_data = base64.b64decode(b64)
-    img = Image.open(io.BytesIO(img_data))
-    img = img.convert("RGB")
-    scale = 3
-    img = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-
-    try:
-        text = pytesseract.image_to_string(img, lang=language, config="--psm 6")
-        text = text.strip()
-        if not text:
-            return "no text"
-        return text
-    except Exception as e:
-        return f"OCR error: {e}"
-
-
-@mcp.tool()
-def window_move(x: int, y: int, name: str = "", resource_class: str = "") -> str:
-    """Move window to (x,y) by name or resource_class."""
-    if not name and not resource_class:
-        return "Provide name or resource_class"
-
-    if SESSION_TYPE == "wayland" and _which("qdbus6"):
-        if _kwin_window_geometry(resource_class=resource_class, caption=name, x=x, y=y):
-            target = resource_class or name
-            return f"ok ({x},{y})"
-
-    if _which("xdotool"):
-        search = name or resource_class
-        try:
-            wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
-            _run(["xdotool", "windowmove", wid, str(x), str(y)])
-            return f"ok ({x},{y})"
-        except Exception as e:
-            return f"Move failed: {e}"
-
-    return "No window management tool available"
-
-
-@mcp.tool()
-def window_resize(width: int, height: int, name: str = "", resource_class: str = "") -> str:
-    """Resize window to width x height by name or resource_class."""
-    if not name and not resource_class:
-        return "Provide name or resource_class"
-
-    if SESSION_TYPE == "wayland" and _which("qdbus6"):
-        if _kwin_window_geometry(resource_class=resource_class, caption=name,
-                                 width=width, height=height):
-            target = resource_class or name
-            return f"ok {width}x{height}"
-
-    if _which("xdotool"):
-        search = name or resource_class
-        try:
-            wid = _run(["xdotool", "search", "--name", search]).split("\n")[0]
-            _run(["xdotool", "windowsize", wid, str(width), str(height)])
-            return f"ok {width}x{height}"
-        except Exception as e:
-            return f"Resize failed: {e}"
-
-    return "No window management tool available"
-
-
-@mcp.tool()
-def wait_for_change(region: str = "", timeout: float = 10.0, interval: float = 0.5) -> str:
-    """Poll screen until pixels change or timeout. region: 'x,y,WxH' or empty."""
-    timeout = min(timeout, 30.0)
-    interval = max(interval, 0.3)
-    r = region if region else None
-
-    initial_hash, _ = _screenshot_hash(r)
-    start = time.time()
-
-    while time.time() - start < timeout:
-        time.sleep(interval)
-        current_hash, _ = _screenshot_hash(r)
-        if current_hash != initial_hash:
-            elapsed = round(time.time() - start, 2)
-            return f"Screen changed after {elapsed}s"
-
-    return f"No change detected after {timeout}s"
-
-
-@mcp.tool()
-def screenshot_diff(region: str = "") -> list[dict]:
-    """Screenshot and diff against previous. region: 'x,y,WxH' or empty."""
-    global _last_screenshot_hash, _last_screenshot_b64
-
-    r = region if region else None
-    new_hash, new_b64 = _screenshot_hash(r)
-
-    if not _last_screenshot_hash:
-        _last_screenshot_hash = new_hash
-        _last_screenshot_b64 = new_b64
-        return [
-            {"type": "text", "text": "first capture, no previous to diff"},
-            {"type": "image", "data": new_b64, "mimeType": "image/jpeg"},
-        ]
-
-    changed = new_hash != _last_screenshot_hash
-
-    old_img = Image.open(io.BytesIO(base64.b64decode(_last_screenshot_b64))).convert("RGB")
-    new_img = Image.open(io.BytesIO(base64.b64decode(new_b64))).convert("RGB")
-
-    diff_description = "CHANGED" if changed else "NO CHANGE"
-
-    changed_pixels = 0
-    total_pixels = 0
-    if old_img.size == new_img.size:
-        old_px = old_img.load()
-        new_px = new_img.load()
-        w, h = old_img.size
-        total_pixels = w * h
-        for py in range(0, h, 4):
-            for px in range(0, w, 4):
-                if old_px[px, py] != new_px[px, py]:
-                    changed_pixels += 1
-        sampled = (h // 4) * (w // 4)
-        pct = round(changed_pixels / sampled * 100, 1) if sampled > 0 else 0
-        diff_description += f" ({pct}% of sampled pixels differ)"
-
-    _last_screenshot_hash = new_hash
-    _last_screenshot_b64 = new_b64
-
-    return [
-        {"type": "text", "text": f"Screenshot diff: {diff_description}"},
-        {"type": "image", "data": new_b64, "mimeType": "image/jpeg"},
-    ]
-
-
-@mcp.tool()
-def read_notifications(count: int = 10, since: str = "1h") -> str:
-    """Read recent notifications from journal. since: '30m','1h','1d'."""
-    notifications = _read_notifications(count, since)
-    if not notifications:
-        return "No recent notification entries found in journal."
-    return json.dumps(notifications, indent=2, ensure_ascii=False)
-
-
-@mcp.tool()
-def send_notification(summary: str, body: str = "") -> str:
-    """Send desktop notification via notify-send."""
-    if _send_notification(summary, body):
-        return "ok"
-    return "Failed to send notification"
 
 
 @mcp.tool()
 def file_dialog(action: str = "open", path: str = "", title: str = "Select File",
                 filters: str = "") -> str:
-    """Native file dialog. action: open/save/directory. Returns selected path."""
+    """Native file dialog. action: open/save/directory."""
     if _which("zenity"):
         cmd = ["zenity"]
         if action == "save":
-            cmd.append("--file-selection")
-            cmd.append("--save")
+            cmd.extend(["--file-selection", "--save"])
         elif action == "directory":
-            cmd.append("--file-selection")
-            cmd.append("--directory")
+            cmd.extend(["--file-selection", "--directory"])
         else:
             cmd.append("--file-selection")
         cmd.extend(["--title", title])
@@ -1235,238 +1278,17 @@ def file_dialog(action: str = "open", path: str = "", title: str = "Select File"
         if filters:
             cmd.append(filters)
     else:
-        return "No file dialog tool. Install zenity or kdialog."
+        return "no dialog tool"
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if result.returncode == 0 and result.stdout.strip():
-            return f"Selected: {result.stdout.strip()}"
-        return "Dialog cancelled (no file selected)"
+            return result.stdout.strip()
+        return "cancelled"
     except subprocess.TimeoutExpired:
-        return "Dialog timed out (60s)"
+        return "timeout"
     except Exception as e:
-        return f"Dialog error: {e}"
-
-
-@mcp.tool()
-def monitors() -> str:
-    """List all connected monitors with name, resolution, position, and scale."""
-    mons = _get_monitors()
-    if not mons:
-        return "Could not detect monitors."
-    return json.dumps(mons, indent=2)
-
-
-@mcp.tool()
-def health_check() -> str:
-    """Test all backends (screenshot, input, clipboard, KWin, OCR)."""
-    health = _check_backend_health()
-    return json.dumps(health, indent=2)
-
-
-@mcp.tool()
-def wait(seconds: float = 1.0) -> str:
-    """Pause seconds (max 30). For UI to settle between actions."""
-    seconds = min(seconds, 30.0)
-    time.sleep(seconds)
-    return "ok"
-
-
-@mcp.tool()
-def find_text(text: str, region: str = "", language: str = "eng") -> str:
-    """Find text on screen via OCR, return click-ready (x,y) coordinates. No image sent."""
-    if not _which("tesseract"):
-        return "tesseract not installed. Run: sudo pacman -S tesseract tesseract-data-eng"
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        if SCREENSHOT_BACKEND == "spectacle":
-            _kill_spectacle()
-            subprocess.run(["spectacle", "-b", "-n", "-f", "-o", tmp],
-                           check=True, timeout=15, capture_output=True)
-        elif SCREENSHOT_BACKEND == "grim":
-            subprocess.run(["grim", tmp], check=True, timeout=10, capture_output=True)
-        elif SCREENSHOT_BACKEND == "scrot":
-            subprocess.run(["scrot", tmp], check=True, timeout=10, capture_output=True)
-        elif SCREENSHOT_BACKEND == "import":
-            subprocess.run(["import", "-window", "root", tmp],
-                           check=True, timeout=10, capture_output=True)
-
-        img = Image.open(tmp)
-
-        offset_x, offset_y = 0, 0
-        if region:
-            parts = region.replace(",", " ").replace("x", " ").split()
-            if len(parts) == 4:
-                rx, ry, rw, rh = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-                img = img.crop((rx, ry, rx + rw, ry + rh))
-                offset_x, offset_y = rx, ry
-
-        img = img.convert("RGB")
-        scale = 3
-        img_scaled = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-
-        data = pytesseract.image_to_data(img_scaled, lang=language,
-                                          config="--psm 6", output_type=pytesseract.Output.DICT)
-
-        matches = []
-        search = text.lower()
-        n = len(data["text"])
-
-        for i in range(n):
-            word = data["text"][i].strip()
-            if not word:
-                continue
-            if search in word.lower():
-                x = data["left"][i] // scale + offset_x
-                y = data["top"][i] // scale + offset_y
-                w = data["width"][i] // scale
-                h = data["height"][i] // scale
-                cx, cy = x + w // 2, y + h // 2
-                matches.append({"text": word, "x": cx, "y": cy, "bounds": f"{x},{y},{w}x{h}"})
-
-        if not search.strip():
-            return "Empty search text."
-
-        # Multi-word: scan consecutive words
-        words = search.split()
-        if len(words) > 1 and not matches:
-            all_words = [(data["text"][i].strip().lower(), i) for i in range(n) if data["text"][i].strip()]
-            for idx in range(len(all_words) - len(words) + 1):
-                chunk = " ".join(all_words[idx + j][0] for j in range(len(words)))
-                if search in chunk:
-                    first_i = all_words[idx][1]
-                    last_i = all_words[idx + len(words) - 1][1]
-                    x1 = data["left"][first_i] // scale + offset_x
-                    y1 = data["top"][first_i] // scale + offset_y
-                    x2 = (data["left"][last_i] + data["width"][last_i]) // scale + offset_x
-                    y2 = (data["top"][last_i] + data["height"][last_i]) // scale + offset_y
-                    cx = (x1 + x2) // 2
-                    cy = (y1 + y2) // 2
-                    matches.append({"text": chunk, "x": cx, "y": cy,
-                                    "bounds": f"{x1},{y1},{x2 - x1}x{y2 - y1}"})
-
-        if not matches:
-            return f"Text '{text}' not found on screen."
-
-        lines = [f"Found {len(matches)} match(es) for '{text}':"]
-        for m in matches[:10]:
-            lines.append(f"  '{m['text']}' at click({m['x']}, {m['y']}) bounds={m['bounds']}")
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"find_text error: {e}"
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-@mcp.tool()
-def describe_screen(region: str = "", language: str = "eng") -> str:
-    """OCR all screen text with positions. No image sent — token efficient."""
-    if not _which("tesseract"):
-        return "tesseract not installed. Run: sudo pacman -S tesseract tesseract-data-eng"
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
-    try:
-        if SCREENSHOT_BACKEND == "spectacle":
-            _kill_spectacle()
-            subprocess.run(["spectacle", "-b", "-n", "-f", "-o", tmp],
-                           check=True, timeout=15, capture_output=True)
-        elif SCREENSHOT_BACKEND == "grim":
-            subprocess.run(["grim", tmp], check=True, timeout=10, capture_output=True)
-        elif SCREENSHOT_BACKEND == "scrot":
-            subprocess.run(["scrot", tmp], check=True, timeout=10, capture_output=True)
-        elif SCREENSHOT_BACKEND == "import":
-            subprocess.run(["import", "-window", "root", tmp],
-                           check=True, timeout=10, capture_output=True)
-
-        img = Image.open(tmp)
-        screen_w, screen_h = img.size
-
-        offset_x, offset_y = 0, 0
-        if region:
-            parts = region.replace(",", " ").replace("x", " ").split()
-            if len(parts) == 4:
-                rx, ry, rw, rh = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-                img = img.crop((rx, ry, rx + rw, ry + rh))
-                offset_x, offset_y = rx, ry
-
-        img = img.convert("RGB")
-        scale = 3
-        img_scaled = img.resize((img.width * scale, img.height * scale), Image.LANCZOS)
-
-        data = pytesseract.image_to_data(img_scaled, lang=language,
-                                          config="--psm 6", output_type=pytesseract.Output.DICT)
-
-        lines_by_block = {}
-        n = len(data["text"])
-        for i in range(n):
-            word = data["text"][i].strip()
-            if not word:
-                continue
-            block = data["block_num"][i]
-            line = data["line_num"][i]
-            key = (block, line)
-            if key not in lines_by_block:
-                lines_by_block[key] = {
-                    "words": [],
-                    "left": data["left"][i] // scale + offset_x,
-                    "top": data["top"][i] // scale + offset_y,
-                }
-            lines_by_block[key]["words"].append(word)
-            right = (data["left"][i] + data["width"][i]) // scale + offset_x
-            bottom = (data["top"][i] + data["height"][i]) // scale + offset_y
-            lines_by_block[key]["right"] = right
-            lines_by_block[key]["bottom"] = bottom
-
-        if not lines_by_block:
-            return f"No text detected on screen ({screen_w}x{screen_h})."
-
-        result = [f"Screen text ({screen_w}x{screen_h}):"]
-        for key in sorted(lines_by_block.keys()):
-            entry = lines_by_block[key]
-            text = " ".join(entry["words"])
-            cy = (entry["top"] + entry.get("bottom", entry["top"])) // 2
-            result.append(f"  y={cy}: {text}")
-
-        return "\n".join(result)
-
-    except Exception as e:
-        return f"describe_screen error: {e}"
-    finally:
-        Path(tmp).unlink(missing_ok=True)
-
-
-@mcp.tool()
-def smart_click(text: str, button: str = "left", click_type: str = "single",
-                occurrence: int = 1, region: str = "", language: str = "eng") -> str:
-    """Find text via OCR and click it. One call does find + click."""
-    result = find_text(text, region, language)
-    if "not found" in result or "error" in result or "not installed" in result:
-        return result
-
-    lines = result.strip().split("\n")
-    matches = []
-    for line in lines[1:]:
-        if "click(" in line:
-            import re as _re
-            m = _re.search(r"click\((\d+),\s*(\d+)\)", line)
-            if m:
-                matches.append((int(m.group(1)), int(m.group(2))))
-
-    if not matches:
-        return f"Found text '{text}' but could not parse coordinates."
-
-    idx = min(occurrence, len(matches)) - 1
-    x, y = matches[idx]
-
-    _mouse_move(x, y)
-    time.sleep(0.05)
-    _mouse_click(button, click_type)
-
-    return f"ok ({x},{y})"
+        return f"err: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -1475,7 +1297,7 @@ def smart_click(text: str, button: str = "left", click_type: str = "single",
 
 if __name__ == "__main__":
     import sys
-    print(f"Computer Use MCP Server v0.4.0", file=sys.stderr)
+    print(f"Computer Use MCP Server v0.5.0", file=sys.stderr)
     print(f"  Session: {SESSION_TYPE}", file=sys.stderr)
     print(f"  Screenshot: {SCREENSHOT_BACKEND}", file=sys.stderr)
     print(f"  Input: {INPUT_BACKEND}", file=sys.stderr)

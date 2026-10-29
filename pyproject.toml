@@ -1,0 +1,13 @@
+[project]
+name = "compuse"
+version = "0.5.0"
+description = "Computer Use MCP Server for Linux (KDE Wayland + X11 fallback)"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "Pillow>=10.0.0",
+    "pytesseract>=0.3.10",
+]
+
+[project.urls]
+Repository = "https://github.com/Jst3r/compuse"

@@ -36,7 +36,7 @@ if [ ! -d "$DIR/.venv" ]; then
     python3 -m venv "$DIR/.venv"
 fi
 source "$DIR/.venv/bin/activate"
-pip install -q -r "$DIR/requirements.txt"
+pip install -q -r "$DIR/requirements.txt" 2>/dev/null || pip install -q "$DIR"
 
 echo ""
 echo "--- Setup complete ---"
@@ -46,7 +46,7 @@ echo ""
 cat <<JSONEOF
 {
   "mcpServers": {
-    "computer-use": {
+    "compuse": {
       "command": "$DIR/.venv/bin/python",
       "args": ["$DIR/server.py"]
     }
